@@ -1,5 +1,6 @@
 const { earliestArrival } = require('./graph');
 const { detectConflicts } = require('./conflicts');
+const { evaluateDependencies } = require('./dependencies');
 
 const MODES = ['classic', 'propagate'];
 
@@ -76,6 +77,7 @@ function validate(data, mode = 'classic') {
   const areaName = new Map(data.areas.map((a) => [a.id, a.name]));
   const actors = [];
   const occupancies = []; // 所有演员逐边路线对无向连接的占用区间 [进入, 离开)
+  const cueIndex = new Map(); // cueId → 当前模式下的实际时刻（供跨演员口令依赖校验）
   let ok = 0;
   let failed = 0;
   let unreachable = 0;
@@ -84,10 +86,40 @@ function validate(data, mode = 'classic') {
     const actorIndex = data.actors.indexOf(actor);
     const sim = simulateActor(data, actor, mode);
 
+    // 首条口令视为准时到位：实际到达与实际出发（=为执行首条口令起算）均取计划时刻
+    if (sim.cues.length > 0) {
+      const first = sim.cues[0];
+      cueIndex.set(first.id, {
+        cue: first,
+        actorId: actor.id,
+        actorName: actor.name,
+        areaName: areaName.get(first.areaId),
+        time: first.time,
+        arrival: first.time,
+        depart: first.time,
+        reachable: true,
+      });
+    }
+
     const segments = [];
     for (const s of sim.segments) {
       const { from, to, dwell, plannedDepart, depart, inheritedDelay, route } = s;
       const available = to.time - depart;
+
+      // 后置口令（to）在当前模式下的实际时刻：
+      // 实际出发 = 为执行该口令而离开上一口令的区段出发时刻（depart）；
+      // 不可达时实际到达未知，该口令标为不可达（传导模式下其后续区段自计划时刻重新起算，
+      // 不影响后续口令按各自区段结果另行登记）。
+      cueIndex.set(to.id, {
+        cue: to,
+        actorId: actor.id,
+        actorName: actor.name,
+        areaName: areaName.get(to.areaId),
+        time: to.time,
+        arrival: route ? route.time : null,
+        depart,
+        reachable: !!route,
+      });
 
       let required = null;
       let slack = null;
@@ -180,6 +212,15 @@ function validate(data, mode = 'classic') {
   // 通道占用冲突：汇总全部逐边占用，按无向连接检测超载区间并合并连续时段
   const conflicts = detectConflicts(data.edges, occupancies, (id) => areaName.get(id));
 
+  // 跨演员口令依赖：以各口令在当前模式下的实际时刻评估满足 / 违约 / 无法判定
+  const dependencies = evaluateDependencies(data.dependencies || [], cueIndex);
+  const dependencySummary = {
+    total: dependencies.total,
+    satisfied: dependencies.satisfied,
+    violated: dependencies.violated,
+    unknown: dependencies.unknown,
+  };
+
   // 将冲突关联到相关区段（按演员 + 区段号匹配占用）
   const segByKey = new Map();
   actors.forEach((ar) => {
@@ -213,9 +254,11 @@ function validate(data, mode = 'classic') {
       failed,
       unreachable,
       conflicts: conflicts.length,
+      dependencies: dependencySummary,
     },
     actors,
     conflicts,
+    dependencies,
   };
 }
 

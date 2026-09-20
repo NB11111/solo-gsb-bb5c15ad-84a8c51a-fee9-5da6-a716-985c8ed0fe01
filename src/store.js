@@ -19,7 +19,7 @@ function ensureDataFile() {
 
 /** 规整数据结构：补齐缺失的集合与基线存储（兼容旧版数据文件） */
 function normalize(data) {
-  for (const key of ['areas', 'edges', 'actors', 'cues']) {
+  for (const key of ['areas', 'edges', 'actors', 'cues', 'dependencies']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
   // baselines: { [mode]: { savedAt, result } }，基线随数据持久化

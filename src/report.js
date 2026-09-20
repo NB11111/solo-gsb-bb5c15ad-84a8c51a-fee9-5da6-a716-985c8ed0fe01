@@ -12,6 +12,18 @@ const STATUS_TEXT = {
   unreachable: '⛔ 区域不可达',
 };
 
+const DEPENDENCY_STATUS_TEXT = {
+  satisfied: '✅ 满足',
+  violated: '❌ 违约',
+  unknown: '❓ 无法判定',
+};
+
+const DEPENDENCY_REASON_TEXT = {
+  'pre-unreachable': '前置口令在当前模式下不可达，实际完成时刻未知',
+  'post-unreachable': '后置口令在当前模式下不可达，实际出发时刻未知',
+  missing: '依赖的口令已被删除',
+};
+
 /** 将单个区段的实际路线渲染为带时刻与等待信息的行进链 */
 function renderLegChain(seg) {
   let chain = `${fmtTime(seg.actualDepart !== undefined ? seg.actualDepart : seg.from.time)}「${seg.from.areaName}」`;
@@ -139,6 +151,74 @@ function segmentConflictBadge(seg) {
   if (!seg.conflicts || seg.conflicts.length === 0) return '';
   const peak = Math.max(...seg.conflicts.map((c) => c.peak));
   return ` 🚶通道冲突×${seg.conflicts.length}（峰值${peak}人）`;
+}
+
+/* ---------- 跨演员口令依赖 ---------- */
+
+/** 口令描述：演员名 · mm:ss · 区域名（口令说明） */
+function dependencyCueText(c) {
+  let t = `${c.actorName} · ${c.time === null ? '—' : fmtTime(c.time)} · ${c.areaName}`;
+  if (c.note) t += `（${c.note}）`;
+  return t;
+}
+
+/** 跨演员口令依赖汇总 + 明细表 */
+function renderDependencySummary(lines, result) {
+  const dep = result.dependencies;
+  if (!dep) return;
+  lines.push('## 跨演员口令依赖校验');
+  lines.push('');
+  lines.push('判定口径：前置完成时刻 = 前置口令在当前模式下的实际到达时刻 + 停留时长；');
+  lines.push('后置实际出发 = 为执行后置口令而离开上一口令的区段出发时刻（首条口令取计划时刻）。');
+  lines.push('满足要求：前置完成时刻 + 等待秒数 ≤ 后置实际出发时刻。');
+  lines.push('');
+  if (dep.total === 0) {
+    lines.push('暂无跨演员口令依赖，可在页面「跨演员口令依赖」面板新增。');
+    lines.push('');
+    return;
+  }
+  const s = { ...{ satisfied: 0, violated: 0, unknown: 0 }, ...result.summary.dependencies };
+  lines.push(
+    `共 **${dep.total}** 条有向约束：✅ 满足 **${s.satisfied}** · ❌ 违约 **${s.violated}** · ❓ 无法判定 **${s.unknown}**。`
+  );
+  lines.push('');
+  lines.push('| # | 前置口令 | 前置完成 | 等待 | 后置口令 | 后置实际出发 | 最早允许出发 | 相差 | 结论 |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  dep.items.forEach((d, idx) => {
+    const verdict = DEPENDENCY_STATUS_TEXT[d.status];
+    let diff;
+    if (d.status === 'satisfied') diff = `满足（富余 ${d.diffSeconds} 秒）`;
+    else if (d.status === 'violated') diff = `违约（缺口 ${-d.diffSeconds} 秒）`;
+    else diff = DEPENDENCY_REASON_TEXT[d.reason] || '无法判定';
+    lines.push(
+      `| ${idx + 1} | ${dependencyCueText(d.pre)} | ${d.preFinish === null ? '—' : fmtTime(d.preFinish)} | ${d.waitSeconds} 秒 | ` +
+        `${dependencyCueText(d.post)} | ${d.postDepart === null ? '—' : fmtTime(d.postDepart)} | ` +
+        `${d.earliestAllowed === null ? '—' : fmtTime(d.earliestAllowed)} | ${diff} | ${verdict} |`
+    );
+  });
+  lines.push('');
+
+  // 违约与无法判定逐条给出文字明细
+  const problems = dep.items.filter((d) => d.status !== 'satisfied');
+  if (problems.length > 0) {
+    lines.push('### 依赖明细（违约 / 无法判定）');
+    lines.push('');
+    for (const d of problems) {
+      if (d.status === 'violated') {
+        lines.push(
+          `- ❌ 「${dependencyCueText(d.pre)}」完成于 ${fmtTime(d.preFinish)}，要求至少等待 ${d.waitSeconds} 秒` +
+            `（最早 ${fmtTime(d.earliestAllowed)} 出发），但「${dependencyCueText(d.post)}」的实际出发为 ` +
+            `${fmtTime(d.postDepart)}，**早 ${-d.diffSeconds} 秒**。`
+        );
+      } else {
+        lines.push(
+          `- ❓ 「${dependencyCueText(d.pre)}」 → 「${dependencyCueText(d.post)}」（等待 ${d.waitSeconds} 秒）：` +
+            `${DEPENDENCY_REASON_TEXT[d.reason] || '无法判定'}，本约束无法判定。`
+        );
+      }
+    }
+    lines.push('');
+  }
 }
 
 /* ---------- 基线对比摘要 ---------- */
@@ -396,11 +476,15 @@ function toMarkdown(result, evacuation) {
   lines.push(`| ❌ 无法按时抵达 | ${s.failed} |`);
   lines.push(`| ⛔ 区域不可达 | ${s.unreachable} |`);
   lines.push(`| 🚶 通道占用冲突 | ${s.conflicts || 0} |`);
+  const depS = s.dependencies || { total: 0, satisfied: 0, violated: 0, unknown: 0 };
+  lines.push(`| 🔗 跨演员口令依赖 | ${depS.total}（✅ ${depS.satisfied} / ❌ ${depS.violated} / ❓ ${depS.unknown}） |`);
   lines.push('');
 
   renderBaselineComparison(lines, result);
 
   renderConflictSummary(lines, result);
+
+  renderDependencySummary(lines, result);
 
   for (const actor of result.actors) {
     lines.push(`## ${actor.actorName}`);

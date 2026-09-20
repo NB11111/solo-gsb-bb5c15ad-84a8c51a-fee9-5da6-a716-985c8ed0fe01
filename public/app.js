@@ -8,7 +8,7 @@ const MODE_LABEL = {
 const MODE_NAME = { propagate: '连续口令延误传导', classic: '区段独立校验' };
 
 const state = {
-  data: { areas: [], edges: [], actors: [], cues: [] },
+  data: { areas: [], edges: [], actors: [], cues: [], dependencies: [] },
   validation: null,
   mode: localStorage.getItem('validate-mode') === 'classic' ? 'classic' : 'propagate',
   evacuation: null, // 已生成快照的参数 { time, exits: [areaId] }；null 表示未启用
@@ -65,7 +65,9 @@ async function api(path, method = 'GET', body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `请求失败（${res.status}）`);
+    const e = new Error(err.error || `请求失败（${res.status}）`);
+    e.payload = err; // 保留完整响应体（如依赖成环时的口令链）
+    throw e;
   }
   return res.status === 204 ? null : res.json();
 }
@@ -90,6 +92,7 @@ async function refresh() {
   renderEdges();
   renderActors();
   renderCues();
+  renderDependencies();
   renderValidation();
   renderEvacExitOptions();
   await refreshEvacuation();
@@ -99,6 +102,7 @@ async function refresh() {
 async function refreshValidation() {
   state.validation = await api(`/api/validate?mode=${state.mode}`);
   renderValidation();
+  renderDependencies(); // 跨演员口令依赖按当前模式的实际时刻判定，模式切换后随动重算
 }
 
 /** 更新「导出校验报告」链接：已生成疏散快照时携带同一快照参数，报告将追加同一快照 */
@@ -199,6 +203,159 @@ function renderCues() {
 }
 
 const STATUS_LABEL = { ok: '✅ 可达', fail: '❌ 超时', unreachable: '⛔ 不可达' };
+
+/* ---------- 跨演员口令依赖 ---------- */
+
+const DEP_STATUS_LABEL = { satisfied: '✅ 满足', violated: '❌ 违约', unknown: '❓ 无法判定' };
+const DEP_REASON_TEXT = {
+  'pre-unreachable': '前置口令在当前模式下不可达，实际完成时刻未知',
+  'post-unreachable': '后置口令在当前模式下不可达，实际出发时刻未知',
+  missing: '依赖的口令已被删除',
+};
+
+/** 全部口令按 演员 → 时间 排序（依赖下拉与标签共用） */
+function sortedCues() {
+  return state.data.cues
+    .slice()
+    .sort((x, y) => actorName(x.actorId).localeCompare(actorName(y.actorId), 'zh') || x.time - y.time);
+}
+
+/** 口令下拉选项文本：演员 mm:ss 区域（说明） */
+function cueOptionText(c) {
+  return `${actorName(c.actorId)} ${fmtTime(c.time)} ${areaName(c.areaId)}${c.note ? `（${c.note}）` : ''}`;
+}
+
+/** 填充依赖前置 / 后置口令下拉（按演员分组） */
+function renderDependencySelects() {
+  const groups = new Map();
+  for (const c of sortedCues()) {
+    const name = actorName(c.actorId);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(c);
+  }
+  const html =
+    [...groups.entries()]
+      .map(([name, cues]) => {
+        const opts = cues.map((c) => `<option value="${c.id}">${escapeHtml(cueOptionText(c))}</option>`).join('');
+        return `<optgroup label="${escapeHtml(name)}">${opts}</optgroup>`;
+      })
+      .join('') || '<option value="">（暂无口令，请先添到位口令）</option>';
+  const curPre = $('dep-pre').value;
+  const curPost = $('dep-post').value;
+  $('dep-pre').innerHTML = `<option value="" disabled selected>选择前置口令…</option>${html}`;
+  $('dep-post').innerHTML = `<option value="" disabled selected>选择后置口令…</option>${html}`;
+  if (curPre) $('dep-pre').value = curPre;
+  if (curPost) $('dep-post').value = curPost;
+}
+
+/** 依赖表格中的口令单元格：演员 + 时刻 + 区域 + 说明 */
+function depCueCell(c) {
+  if (!c || c.cueId === null) return '<span class="empty-hint">（口令已删除）</span>';
+  return `${escapeHtml(c.actorName)}<span class="time-detail">${fmtTime(c.time)} · ${escapeHtml(c.areaName)}${c.note ? ' · ' + escapeHtml(c.note) : ''}</span>`;
+}
+
+/** 跨演员口令依赖总览徽章 + 明细表格（随数据与模式即时重算） */
+function renderDependencies() {
+  renderDependencySelects();
+  const overview = $('dependency-overview');
+  const tbody = $('dependencies-tbody');
+  const v = state.validation;
+  const deps = (state.data.dependencies || []).slice();
+
+  if (deps.length === 0) {
+    overview.innerHTML = '';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-hint">暂无跨演员口令依赖，在上方选择两条口令新增约束。</td></tr>';
+    return;
+  }
+
+  // 校验结果按 id 索引（切换模式后随 validate 结果变化）
+  const evaluated = new Map(((v && v.dependencies && v.dependencies.items) || []).map((d) => [d.id, d]));
+
+  const counts = { total: deps.length, satisfied: 0, violated: 0, unknown: 0 };
+  const rows = deps.map((d) => {
+    const r = evaluated.get(d.id);
+    if (!r) {
+      return `<tr class="dep-unknown">
+        <td>${escapeHtml(d.preCueId)}</td><td>—</td><td>${d.waitSeconds} 秒</td>
+        <td>${escapeHtml(d.postCueId)}</td><td>—</td><td>—</td>
+        <td><span class="empty-hint">请先校验</span></td>
+        <td><span class="status-pill unknown">❓ 无法判定</span></td>
+        <td class="col-ops"><button class="btn btn-danger" data-del-dep="${d.id}">删除</button></td>
+      </tr>`;
+    }
+    counts[r.status]++;
+
+    let diffCell;
+    if (r.status === 'satisfied') {
+      diffCell = `<span class="ontime-tag">富余 ${r.diffSeconds} 秒</span>`;
+    } else if (r.status === 'violated') {
+      diffCell = `<span class="late-tag">缺口 ${-r.diffSeconds} 秒</span>`;
+    } else {
+      diffCell = `<span class="empty-hint">${escapeHtml(DEP_REASON_TEXT[r.reason] || '无法判定')}</span>`;
+    }
+
+    return `<tr class="dep-${r.status}">
+      <td>${depCueCell(r.pre)}</td>
+      <td>${r.preFinish === null ? '<span class="empty-hint">—</span>' : fmtTime(r.preFinish)}</td>
+      <td>${r.waitSeconds} 秒</td>
+      <td>${depCueCell(r.post)}</td>
+      <td>${r.postDepart === null ? '<span class="empty-hint">—</span>' : fmtTime(r.postDepart)}</td>
+      <td>${r.earliestAllowed === null ? '<span class="empty-hint">—</span>' : fmtTime(r.earliestAllowed)}</td>
+      <td>${diffCell}</td>
+      <td><span class="status-pill ${r.status === 'satisfied' ? 'ok' : r.status === 'violated' ? 'fail' : 'unreachable'}">${DEP_STATUS_LABEL[r.status]}</span></td>
+      <td class="col-ops"><button class="btn btn-danger" data-del-dep="${d.id}">删除</button></td>
+    </tr>`;
+  });
+
+  overview.innerHTML = `
+    <span class="dep-chip">依赖 <strong>${counts.total}</strong></span>
+    <span class="dep-chip ${counts.satisfied ? 'good' : ''}">✅ 满足 <strong>${counts.satisfied}</strong></span>
+    <span class="dep-chip ${counts.violated ? 'bad' : ''}">❌ 违约 <strong>${counts.violated}</strong></span>
+    <span class="dep-chip ${counts.unknown ? 'warn' : ''}">❓ 无法判定 <strong>${counts.unknown}</strong></span>`;
+  tbody.innerHTML = rows.join('');
+}
+
+function bindDependencies() {
+  $('form-dependency').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const preCueId = $('dep-pre').value;
+    const postCueId = $('dep-post').value;
+    const waitSeconds = Number($('dep-wait').value);
+    if (!preCueId || !postCueId) {
+      toast('请分别选择前置口令与后置口令', true);
+      return;
+    }
+    if (preCueId === postCueId) {
+      toast('前置口令与后置口令不能是同一条口令', true);
+      return;
+    }
+    if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 3600) {
+      toast('等待秒数必须是 0～3600 的整数秒', true);
+      return;
+    }
+    mutate(async () => {
+      try {
+        await api('/api/dependencies', 'POST', { preCueId, postCueId, waitSeconds });
+        $('dep-wait').value = '';
+      } catch (err) {
+        // 成环错误：服务端返回构成环的口令链，明确提示且不写入
+        if (err.payload && err.payload.chain) {
+          throw new Error(`${err.message}：${err.payload.chain}`);
+        }
+        throw err;
+      }
+    }, '依赖已添加，已即时重算');
+  });
+
+  // 删除依赖：事件委托（表格随数据重绘）
+  $('dependencies-tbody').addEventListener('click', (e) => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    const { delDep } = t.dataset;
+    if (!delDep) return;
+    mutate(() => api(`/api/dependencies/${delDep}`, 'DELETE'), '依赖已删除，已即时重算');
+  });
+}
 
 function renderSummary(s) {
   $('summary').innerHTML = `
@@ -1018,6 +1175,7 @@ function bindHeaderActions() {
   bindTableActions();
   bindHeaderActions();
   bindEvacuation();
+  bindDependencies();
   setMode(state.mode);
   try {
     await refresh();

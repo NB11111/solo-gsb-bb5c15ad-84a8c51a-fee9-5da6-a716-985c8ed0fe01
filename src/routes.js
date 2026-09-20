@@ -5,6 +5,12 @@ const { validate, MODES } = require('./validate');
 const { evacuationSnapshot } = require('./evacuation');
 const { buildComparison } = require('./baseline');
 const { toMarkdown } = require('./report');
+const {
+  MAX_WAIT_SECONDS,
+  normalizeDependency,
+  findCycle,
+  cycleChainText,
+} = require('./dependencies');
 
 const router = express.Router();
 
@@ -222,6 +228,81 @@ router.delete('/baseline/:mode', (req, res) => {
   res.status(204).end();
 });
 
+/* ---------- 跨演员口令依赖 ---------- */
+
+/** 构造口令标签索引（环错误文案用）：cueId → { cue, actorName, areaName } */
+function buildCueLabelIndex(data) {
+  const actorName = new Map(data.actors.map((a) => [a.id, a.name]));
+  const areaName = new Map(data.areas.map((a) => [a.id, a.name]));
+  const idx = new Map();
+  for (const cue of data.cues) {
+    idx.set(cue.id, {
+      cue,
+      actorId: cue.actorId,
+      actorName: actorName.get(cue.actorId) || cue.actorId,
+      areaName: areaName.get(cue.areaId) || cue.areaId,
+      time: cue.time,
+    });
+  }
+  return idx;
+}
+
+/** 新增跨演员口令依赖：校验两端口令、等待秒数、重复边与整图成环，任一不通过均不写入 */
+router.post('/dependencies', (req, res) => {
+  const data = store.load();
+  const body = req.body || {};
+
+  if (!isNonEmptyString(body.preCueId) || !data.cues.some((c) => c.id === body.preCueId)) {
+    return res.status(400).json({ error: '前置口令必须是已存在的口令' });
+  }
+  if (!isNonEmptyString(body.postCueId) || !data.cues.some((c) => c.id === body.postCueId)) {
+    return res.status(400).json({ error: '后置口令必须是已存在的口令' });
+  }
+  if (body.preCueId === body.postCueId) {
+    return res.status(400).json({ error: '前置口令与后置口令不能是同一条口令' });
+  }
+  if (!isNonNegativeInt(body.waitSeconds) || body.waitSeconds > MAX_WAIT_SECONDS) {
+    return res.status(400).json({ error: `等待秒数必须是 0～${MAX_WAIT_SECONDS} 的整数秒` });
+  }
+
+  if (
+    data.dependencies.some((d) => d.preCueId === body.preCueId && d.postCueId === body.postCueId)
+  ) {
+    return res.status(409).json({ error: '这两条口令之间已存在依赖，可直接删除后重新添加' });
+  }
+
+  // 保存前检查整张依赖图：新边与已有边构成环则拒绝写入
+  const cycle = findCycle(data.dependencies, { preCueId: body.preCueId, postCueId: body.postCueId });
+  if (cycle) {
+    const labelIndex = buildCueLabelIndex(data);
+    return res.status(400).json({
+      error: '依赖图存在环路，未保存：新增后口令将互相等待',
+      cycle, // 构成环的口令 ID 链（按环顺序，首尾不重复）
+      chain: cycleChainText(cycle, labelIndex), // 可读口令链（已接回环起点）
+    });
+  }
+
+  const item = normalizeDependency({
+    id: crypto.randomUUID(),
+    preCueId: body.preCueId,
+    postCueId: body.postCueId,
+    waitSeconds: body.waitSeconds,
+  });
+  data.dependencies.push(item);
+  store.save();
+  res.status(201).json(item);
+});
+
+/** 删除跨演员口令依赖 */
+router.delete('/dependencies/:id', (req, res) => {
+  const data = store.load();
+  const idx = data.dependencies.findIndex((d) => d.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: '依赖不存在' });
+  data.dependencies.splice(idx, 1);
+  store.save();
+  res.status(204).end();
+});
+
 /* ---------- 通用 CRUD ---------- */
 
 const COLLECTIONS = ['areas', 'edges', 'actors', 'cues'];
@@ -287,9 +368,24 @@ router.delete('/:collection/:id', (req, res) => {
   // 级联清理，保证校验数据一致
   if (collection === 'areas') {
     data.edges = data.edges.filter((e) => e.a !== id && e.b !== id);
+    const removedCues = data.cues.filter((c) => c.areaId === id);
     data.cues = data.cues.filter((c) => c.areaId !== id);
+    // 删除区域连带删除口令时，级联清理这些口令上的跨演员依赖
+    if (removedCues.length > 0) {
+      const removedIds = new Set(removedCues.map((c) => c.id));
+      data.dependencies = data.dependencies.filter((d) => !removedIds.has(d.preCueId) && !removedIds.has(d.postCueId));
+    }
   } else if (collection === 'actors') {
+    const removedCues = data.cues.filter((c) => c.actorId === id);
     data.cues = data.cues.filter((c) => c.actorId !== id);
+    // 删除演员连带删除口令时，级联清理这些口令上的跨演员依赖
+    if (removedCues.length > 0) {
+      const removedIds = new Set(removedCues.map((c) => c.id));
+      data.dependencies = data.dependencies.filter((d) => !removedIds.has(d.preCueId) && !removedIds.has(d.postCueId));
+    }
+  } else if (collection === 'cues') {
+    // 删除口令：级联清理以其为前置或后置的全部依赖
+    data.dependencies = data.dependencies.filter((d) => d.preCueId !== id && d.postCueId !== id);
   }
 
   store.save();

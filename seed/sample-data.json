@@ -41,5 +41,10 @@
     { "id": "cue-l5", "actorId": "actor-li", "areaId": "area-downstage", "time": 120, "dwell": 0, "note": "台前谢幕" },
     { "id": "cue-w1", "actorId": "actor-wang", "areaId": "area-downstage", "time": 0, "dwell": 0, "note": "开场旁白" },
     { "id": "cue-w2", "actorId": "actor-wang", "areaId": "area-roof", "time": 30, "dwell": 0, "note": "天台布景（不可达示例）" }
+  ],
+  "dependencies": [
+    { "id": "dep-l2-z4", "preCueId": "cue-l2", "postCueId": "cue-z4", "waitSeconds": 5 },
+    { "id": "dep-l2-z3", "preCueId": "cue-l2", "postCueId": "cue-z3", "waitSeconds": 0 },
+    { "id": "dep-z2-w2", "preCueId": "cue-z2", "postCueId": "cue-w2", "waitSeconds": 10 }
   ]
 }

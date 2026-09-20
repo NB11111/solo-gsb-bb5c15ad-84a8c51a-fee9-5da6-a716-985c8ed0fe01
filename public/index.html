@@ -12,7 +12,7 @@
       <span class="logo">🎭</span>
       <div>
         <h1>舞台走位校验系统</h1>
-        <p class="subtitle">区域连接图 · 通道容量与封闭时段 · 到位口令时间校验 · 通道占用冲突</p>
+        <p class="subtitle">区域连接图 · 通道容量与封闭时段 · 到位口令时间校验 · 通道占用冲突 · 跨演员口令依赖</p>
       </div>
     </div>
     <div class="actions">
@@ -143,6 +143,36 @@
         </table>
       </section>
     </div>
+
+    <!-- 跨演员口令依赖 -->
+    <section class="card" id="panel-dependencies">
+      <h2>🔗 跨演员口令依赖</h2>
+      <p class="mode-hint">
+        在两条口令间建立有向约束：<strong>前置口令完成（当前模式下实际到达 + 停留时长）后，至少等待 N 秒，为执行后置口令而实际出发才可发生</strong>。
+        保存前会检查整张依赖图，<strong>成环时拒绝写入并给出构成环的口令链</strong>；校验结果随当前模式即时重算：✅ 满足（显示富余秒数）、❌ 违约（显示缺口秒数）、❓ 无法判定（任一端口令在当前模式下不可达）。
+        删除口令（含删除演员 / 区域连带删除）时自动清理相关约束。
+      </p>
+      <form id="form-dependency" class="entity-form dep-form">
+        <select id="dep-pre" required></select>
+        <span class="dep-arrow">完成后至少等待</span>
+        <input type="number" id="dep-wait" placeholder="等待秒数" min="0" max="3600" step="1" required style="max-width:110px" />
+        <span class="dep-arrow">秒，才可执行</span>
+        <select id="dep-post" required></select>
+        <div class="form-buttons">
+          <button type="submit" class="btn btn-accent" id="dep-submit">添加依赖</button>
+        </div>
+      </form>
+      <div id="dependency-overview" class="dep-overview"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>前置口令</th><th>前置完成</th><th>等待</th><th>后置口令</th><th>后置实际出发</th>
+            <th>最早允许出发</th><th>相差</th><th>结论</th><th class="col-ops">操作</th>
+          </tr>
+        </thead>
+        <tbody id="dependencies-tbody"></tbody>
+      </table>
+    </section>
   </main>
 
   <div id="toast" class="toast hidden"></div>
