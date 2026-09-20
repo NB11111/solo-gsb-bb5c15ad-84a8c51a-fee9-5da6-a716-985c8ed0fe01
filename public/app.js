@@ -8,7 +8,7 @@ const MODE_LABEL = {
 const MODE_NAME = { propagate: '连续口令延误传导', classic: '区段独立校验' };
 
 const state = {
-  data: { areas: [], edges: [], actors: [], cues: [] },
+  data: { areas: [], edges: [], actors: [], cues: [], dependencies: [] },
   validation: null,
   mode: localStorage.getItem('validate-mode') === 'classic' ? 'classic' : 'propagate',
   evacuation: null, // 已生成快照的参数 { time, exits: [areaId] }；null 表示未启用
@@ -90,6 +90,7 @@ async function refresh() {
   renderEdges();
   renderActors();
   renderCues();
+  renderDependencies();
   renderValidation();
   renderEvacExitOptions();
   await refreshEvacuation();
@@ -99,6 +100,7 @@ async function refresh() {
 async function refreshValidation() {
   state.validation = await api(`/api/validate?mode=${state.mode}`);
   renderValidation();
+  renderDependencies();
 }
 
 /** 更新「导出校验报告」链接：已生成疏散快照时携带同一快照参数，报告将追加同一快照 */
@@ -208,6 +210,7 @@ function renderSummary(s) {
     <div class="badge fail"><span class="num">${s.failed}</span><span class="label">无法按时抵达</span></div>
     <div class="badge warn"><span class="num">${s.unreachable}</span><span class="label">区域不可达</span></div>
     <div class="badge conflict"><span class="num">${s.conflicts || 0}</span><span class="label">通道占用冲突</span></div>
+    <div class="badge dep"><span class="num">${s.dependencies || 0}</span><span class="label">口令依赖 满足${s.dependenciesSatisfied || 0}/违约${s.dependenciesViolated || 0}/未知${s.dependenciesUnknown || 0}</span></div>
   `;
 }
 
@@ -723,6 +726,183 @@ function bindEvacuation() {
   });
 }
 
+/* ---------- 跨演员口令依赖 ---------- */
+
+const DEP_STATUS_LABEL = {
+  satisfied: '✅ 满足',
+  violated: '❌ 违约',
+  unknown: '❓ 无法判定',
+};
+
+/** 口令选项文本：时刻 区域（说明）（演员由下拉分组标题展示） */
+function cueOptionText(c) {
+  const note = c.note ? `（${c.note}）` : '';
+  return `${fmtTime(c.time)} ${escapeHtml(areaName(c.areaId))}${escapeHtml(note)}`;
+}
+
+/** 填充依赖表单的两个口令下拉（按演员分组、组内按时间升序） */
+function fillDependencySelects() {
+  const groups = new Map();
+  const sortedCues = state.data.cues.slice().sort((x, y) => x.time - y.time);
+  for (const c of sortedCues) {
+    const actor = state.data.actors.find((a) => a.id === c.actorId);
+    const key = c.actorId;
+    if (!groups.has(key)) groups.set(key, { name: actor ? actor.name : '（已删除演员）', cues: [] });
+    groups.get(key).cues.push(c);
+  }
+  const html = [...groups.values()]
+    .map(
+      (g) =>
+        `<optgroup label="${escapeHtml(g.name)}">${g.cues
+          .map((c) => `<option value="${c.id}">${cueOptionText(c)}</option>`)
+          .join('')}</optgroup>`
+    )
+    .join('');
+  $('dep-before').innerHTML = html || '<option value="">暂无口令</option>';
+  $('dep-after').innerHTML = html || '<option value="">暂无口令</option>';
+}
+
+/** 依赖评估条目取前端兜底描述（评估结果缺失时使用数据文件中的原始口令） */
+function fallbackCue(cueId) {
+  const c = state.data.cues.find((x) => x.id === cueId);
+  if (!c) return { cueId, actorName: '（已删除）', time: null, areaName: '（已删除）', note: '', dwell: 0 };
+  return {
+    cueId,
+    actorName: actorName(c.actorId),
+    time: c.time,
+    areaName: areaName(c.areaId),
+    note: c.note || '',
+    dwell: c.dwell > 0 ? c.dwell : 0,
+  };
+}
+
+function renderDependencyCueCell(cue, dwellVisible) {
+  if (!cue || cue.time === null || cue.time === undefined) return escapeHtml('（口令已删除）');
+  const cross = cue.crossActorTag || '';
+  const note = cue.note ? ` · ${escapeHtml(cue.note)}` : '';
+  const dwell = dwellVisible && cue.dwell > 0 ? `<span class="time-detail">停留 ${cue.dwell} 秒</span>` : '';
+  return `<strong>${escapeHtml(cue.actorName)}</strong>${cross}<span class="time-detail">${fmtTime(cue.time)} · ${escapeHtml(cue.areaName)}${note}</span>${dwell}`;
+}
+
+/** 渲染依赖评估表（随校验结果即时重算） */
+function renderDependencies() {
+  const v = state.validation;
+  const el = $('dependency-results');
+  if (!v) return;
+
+  const byId = new Map((v.dependencies?.items || []).map((d) => [d.id, d]));
+  const deps = state.data.dependencies || [];
+
+  if (deps.length === 0) {
+    el.innerHTML = '<p class="empty-hint">暂无口令依赖。选择前置 / 后置口令并填写至少等待秒数后点击「添加依赖」。</p>';
+    fillDependencySelects();
+    return;
+  }
+
+  const s = v.dependencies ? v.dependencies.summary : { total: deps.length, satisfied: 0, violated: 0, unknown: deps.length };
+  const chips = [
+    `<span class="dep-chip">依赖 <strong>${s.total}</strong></span>`,
+    `<span class="dep-chip ${s.satisfied ? 'good' : ''}">满足 <strong>${s.satisfied}</strong></span>`,
+    `<span class="dep-chip ${s.violated ? 'bad' : ''}">违约 <strong>${s.violated}</strong></span>`,
+    `<span class="dep-chip ${s.unknown ? 'warn' : ''}">无法判定 <strong>${s.unknown}</strong></span>`,
+  ].join('');
+
+  // 渲染顺序与服务端一致：违约 → 无法判定 → 满足；评估结果缺失（极端情况）时补在末尾
+  const ordered = v.dependencies
+    ? [...v.dependencies.items, ...deps.filter((d) => !byId.has(d.id))]
+    : deps;
+
+  const rows = ordered
+    .map((raw) => {
+      const d = byId.get(raw.id) || {
+        id: raw.id,
+        waitSeconds: raw.waitSeconds,
+        predecessor: fallbackCue(raw.predecessorId),
+        successor: fallbackCue(raw.successorId),
+        status: 'unknown',
+        reason: '当前模式下暂无评估结果',
+        completionTime: null,
+        successorDepart: null,
+        requiredDepart: null,
+        delta: null,
+      };
+      const before = d.predecessor;
+      const after = d.successor;
+      before.crossActorTag = d.crossActor ? '<span class="cross-tag">跨演员</span>' : '';
+
+      let verdict;
+      if (d.status === 'satisfied') {
+        verdict = `<span class="status-pill ok">✅ 满足</span><span class="time-detail">余量 ${d.delta} 秒</span>`;
+      } else if (d.status === 'violated') {
+        verdict = `<span class="status-pill fail">❌ 违约</span><span class="time-detail"><strong>缺口 ${-d.delta} 秒</strong></span>`;
+      } else {
+        verdict = `<span class="status-pill unreachable">❓ 无法判定</span><span class="time-detail">${escapeHtml(d.reason || '任一端时刻不可得')}</span>`;
+      }
+
+      const timeCell =
+        d.completionTime === null
+          ? '<span class="empty-hint">—</span>'
+          : `<span class="time-detail">完成 ${fmtTime(d.completionTime)}</span>` +
+            `<span class="time-detail">后置实际出发 ${fmtTime(d.successorDepart)}</span>` +
+            `<span class="time-detail">允许最早 ${fmtTime(d.requiredDepart)}</span>`;
+
+      return `<tr class="dep-${d.status}">
+        <td>${renderDependencyCueCell(before, true)}</td>
+        <td class="dep-wait">≥ <strong>${d.waitSeconds}</strong> 秒</td>
+        <td>${renderDependencyCueCell(after, false)}</td>
+        <td>${timeCell}</td>
+        <td>${verdict}</td>
+        <td class="col-ops"><button class="btn btn-danger" data-del-dep="${d.id}">删除</button></td>
+      </tr>`;
+    })
+    .join('');
+
+  el.innerHTML = `
+    <div class="dep-chips">${chips}</div>
+    <p class="dep-hint">判定口径：前置完成时刻 = 当前模式实际到达 + 停留时长；后置实际出发 = 前往后置口令区段的实际出发；相差秒数 = 后置实际出发 −（前置完成 + 等待）。</p>
+    <table class="dep-table">
+      <thead><tr><th>前置口令</th><th>至少等待</th><th>后置口令</th><th>时刻对比</th><th>结论 / 相差秒数</th><th class="col-ops">操作</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  fillDependencySelects();
+}
+
+function bindDependencies() {
+  $('form-dependency').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const predecessorId = $('dep-before').value;
+    const successorId = $('dep-after').value;
+    const waitSeconds = Number($('dep-wait').value);
+    if (!predecessorId || !successorId) {
+      toast('请选择前置口令与后置口令', true);
+      return;
+    }
+    if (predecessorId === successorId) {
+      toast('前置与后置不能是同一条口令', true);
+      return;
+    }
+    if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 3600) {
+      toast('至少等待秒数必须是 0～3600 的整数', true);
+      return;
+    }
+    mutate(
+      async () => {
+        await api('/api/dependencies', 'POST', { predecessorId, successorId, waitSeconds });
+        $('dep-wait').value = '';
+      },
+      '依赖已添加，已即时重算'
+    );
+  });
+
+  $('dependency-results').addEventListener('click', (e) => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    const id = t.dataset.delDep;
+    if (!id) return;
+    mutate(() => api(`/api/dependencies/${id}`, 'DELETE'), '依赖已删除，已即时重算');
+  });
+}
+
 /* ---------- 下拉框选项 ---------- */
 
 function fillSelect(el, items, placeholder) {
@@ -967,6 +1147,7 @@ function bindHeaderActions() {
       clearEdgeForm();
       clearActorForm();
       clearCueForm();
+      $('form-dependency').reset();
     }, '已恢复示例数据');
   });
   document.querySelectorAll('#mode-switch .mode-btn').forEach((btn) => {
@@ -1018,6 +1199,7 @@ function bindHeaderActions() {
   bindTableActions();
   bindHeaderActions();
   bindEvacuation();
+  bindDependencies();
   setMode(state.mode);
   try {
     await refresh();

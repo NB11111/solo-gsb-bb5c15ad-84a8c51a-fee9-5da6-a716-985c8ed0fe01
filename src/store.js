@@ -19,9 +19,14 @@ function ensureDataFile() {
 
 /** 规整数据结构：补齐缺失的集合与基线存储（兼容旧版数据文件） */
 function normalize(data) {
-  for (const key of ['areas', 'edges', 'actors', 'cues']) {
+  for (const key of ['areas', 'edges', 'actors', 'cues', 'dependencies']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
+  // 清理历史残留：依赖任一端口令不存在（如手工编辑过数据文件）时直接丢弃
+  const cueIds = new Set(data.cues.map((c) => c.id));
+  data.dependencies = data.dependencies.filter(
+    (d) => d && cueIds.has(d.predecessorId) && cueIds.has(d.successorId)
+  );
   // baselines: { [mode]: { savedAt, result } }，基线随数据持久化
   if (!data.baselines || typeof data.baselines !== 'object' || Array.isArray(data.baselines)) {
     data.baselines = {};

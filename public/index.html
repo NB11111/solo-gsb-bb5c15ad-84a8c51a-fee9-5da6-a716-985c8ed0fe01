@@ -60,6 +60,27 @@
       <div id="evacuation-results"></div>
     </section>
 
+    <!-- 跨演员口令依赖 -->
+    <section class="card" id="panel-dependencies">
+      <h2>🔗 跨演员口令依赖</h2>
+      <p class="mode-hint">
+        在两条口令之间维护「前置口令完成（当前模式下实际到达 + 停留时长）后至少等待 N 秒，后置口令才可实际出发」的有向约束（两条口令可属于不同演员）。
+        保存前会检查整张依赖图，<strong>成环时拒绝写入并提示闭环口令链</strong>。下方结果按当前校验模式即时重算：
+        ✅ 满足、❌ 违约（附相差秒数）、❓ 无法判定（任一端口令不可达或无实际出发时刻）。删除口令会自动清理相关依赖。
+      </p>
+      <form id="form-dependency" class="entity-form dep-form">
+        <select id="dep-before" required></select>
+        <span class="dep-arrow">—等待 ≥</span>
+        <input type="number" id="dep-wait" min="0" max="3600" step="1" placeholder="秒" class="dep-wait-input" required />
+        <span class="dep-arrow">秒→</span>
+        <select id="dep-after" required></select>
+        <div class="form-buttons">
+          <button type="submit" class="btn btn-accent" id="dep-submit">添加依赖</button>
+        </div>
+      </form>
+      <div id="dependency-results"></div>
+    </section>
+
     <!-- 数据管理 -->
     <div class="panels">
       <section class="card" id="panel-areas">

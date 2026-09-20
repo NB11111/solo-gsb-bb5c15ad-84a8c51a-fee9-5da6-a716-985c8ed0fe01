@@ -5,6 +5,7 @@ const { validate, MODES } = require('./validate');
 const { evacuationSnapshot } = require('./evacuation');
 const { buildComparison } = require('./baseline');
 const { toMarkdown } = require('./report');
+const { findCycle, cycleMessage, MAX_WAIT_SECONDS } = require('./dependencies');
 
 const router = express.Router();
 
@@ -222,6 +223,63 @@ router.delete('/baseline/:mode', (req, res) => {
   res.status(204).end();
 });
 
+/* ---------- 跨演员口令依赖 ---------- */
+
+/** 过滤掉任一端口令已不存在的依赖（删除口令 / 演员 / 区域后保持引用一致） */
+function pruneDependencies(data) {
+  const cueIds = new Set(data.cues.map((c) => c.id));
+  data.dependencies = (data.dependencies || []).filter(
+    (d) => cueIds.has(d.predecessorId) && cueIds.has(d.successorId)
+  );
+}
+
+/** 新增依赖：写入前对整张依赖图做环检测，成环（含自环、重复反向边）不写入 */
+router.post('/dependencies', (req, res) => {
+  const data = store.load();
+  const body = req.body || {};
+  const cueIds = new Set(data.cues.map((c) => c.id));
+  if (!cueIds.has(body.predecessorId) || !cueIds.has(body.successorId)) {
+    return res.status(400).json({ error: '前置 / 后置口令必须是已存在的口令' });
+  }
+  if (body.predecessorId === body.successorId) {
+    return res.status(400).json({ error: '前置与后置不能是同一条口令' });
+  }
+  if (!isNonNegativeInt(body.waitSeconds) || body.waitSeconds > MAX_WAIT_SECONDS) {
+    return res.status(400).json({ error: `至少等待秒数必须是 0～${MAX_WAIT_SECONDS} 的整数` });
+  }
+  const dup = data.dependencies.some(
+    (d) => d.predecessorId === body.predecessorId && d.successorId === body.successorId
+  );
+  if (dup) return res.status(409).json({ error: '这两条口令之间已存在相同方向的依赖' });
+
+  const candidate = {
+    id: crypto.randomUUID(),
+    predecessorId: body.predecessorId,
+    successorId: body.successorId,
+    waitSeconds: body.waitSeconds,
+  };
+  data.dependencies.push(candidate);
+
+  const cycle = findCycle(data.dependencies);
+  if (cycle) {
+    data.dependencies.pop(); // 成环：不写入
+    return res.status(400).json({ error: cycleMessage(data, cycle), cycle });
+  }
+
+  store.save();
+  res.status(201).json(candidate);
+});
+
+/** 删除依赖 */
+router.delete('/dependencies/:id', (req, res) => {
+  const data = store.load();
+  const idx = data.dependencies.findIndex((d) => d.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: '依赖不存在' });
+  data.dependencies.splice(idx, 1);
+  store.save();
+  res.status(204).end();
+});
+
 /* ---------- 通用 CRUD ---------- */
 
 const COLLECTIONS = ['areas', 'edges', 'actors', 'cues'];
@@ -291,6 +349,9 @@ router.delete('/:collection/:id', (req, res) => {
   } else if (collection === 'actors') {
     data.cues = data.cues.filter((c) => c.actorId !== id);
   }
+
+  // 删除口令（或因删除区域 / 演员连带删除口令）后，级联清理相关口令依赖
+  pruneDependencies(data);
 
   store.save();
   res.status(204).end();

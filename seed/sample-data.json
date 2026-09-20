@@ -41,5 +41,10 @@
     { "id": "cue-l5", "actorId": "actor-li", "areaId": "area-downstage", "time": 120, "dwell": 0, "note": "台前谢幕" },
     { "id": "cue-w1", "actorId": "actor-wang", "areaId": "area-downstage", "time": 0, "dwell": 0, "note": "开场旁白" },
     { "id": "cue-w2", "actorId": "actor-wang", "areaId": "area-roof", "time": 30, "dwell": 0, "note": "天台布景（不可达示例）" }
+  ],
+  "dependencies": [
+    { "id": "dep-l2-z3", "predecessorId": "cue-l2", "successorId": "cue-z3", "waitSeconds": 0, "note": "李四独唱结束后张三才能登上二层平台（区段独立模式违约、延误传导模式满足的模式差异演示）" },
+    { "id": "dep-z2-l4", "predecessorId": "cue-z2", "successorId": "cue-l4", "waitSeconds": 5, "note": "张三上台亮相后至少 5 秒李四才能上二层平台（跨演员满足演示）" },
+    { "id": "dep-l2-w2", "predecessorId": "cue-l2", "successorId": "cue-w2", "waitSeconds": 0, "note": "李四独唱后王五方可前往天台（后置口令不可达 → 无法判定演示）" }
   ]
 }

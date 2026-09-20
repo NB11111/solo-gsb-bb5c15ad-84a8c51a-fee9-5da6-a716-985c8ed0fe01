@@ -141,6 +141,61 @@ function segmentConflictBadge(seg) {
   return ` 🚶通道冲突×${seg.conflicts.length}（峰值${peak}人）`;
 }
 
+/* ---------- 跨演员口令依赖 ---------- */
+
+const DEPENDENCY_STATUS_TEXT = {
+  satisfied: '✅ 满足',
+  violated: '❌ 违约',
+  unknown: '❓ 无法判定',
+};
+
+/** 口令位置的纯文本描述：演员 时刻 区域（说明） */
+function dependencyCueText(cue) {
+  if (!cue || cue.cueId === undefined) return '（已删除口令）';
+  const note = cue.note ? `，${cue.note}` : '';
+  const crossActor = cue.actorName ? `${cue.actorName} ` : '';
+  return `${crossActor}${fmtTime(cue.time)}「${cue.areaName}」${note}`;
+}
+
+/** 跨演员口令依赖汇总与明细（前置完成 + 等待 N ≤ 后置实际出发） */
+function renderDependencies(lines, result) {
+  const dep = result.dependencies;
+  lines.push('## 跨演员口令依赖');
+  lines.push('');
+  if (!dep || dep.items.length === 0) {
+    lines.push('未维护跨演员口令依赖。');
+    lines.push('');
+    return;
+  }
+  const s = dep.summary;
+  lines.push(
+    `共 **${s.total}** 条依赖：✅ 满足 **${s.satisfied}** · ❌ 违约 **${s.violated}** · ❓ 无法判定 **${s.unknown}**。`
+  );
+  lines.push('');
+  lines.push(
+    '判定口径：前置口令完成时刻 = 其在当前模式下的实际到达时刻 + 停留时长；后置口令的实际出发时刻取前往该口令区段的实际出发时刻；满足「完成 + 至少等待 N 秒 ≤ 后置实际出发」即为满足，相差秒数为后置实际出发相对最早允许时刻的余量（违约时为负的缺口）。'
+  );
+  lines.push('');
+  lines.push('| # | 前置口令 | 等待 | 后置口令 | 前置完成 | 后置实际出发 | 相差 | 结论 |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+  dep.items.forEach((d, idx) => {
+    const before = dependencyCueText(d.predecessor);
+    const after = dependencyCueText(d.successor);
+    const wait = `≥ ${d.waitSeconds} 秒`;
+    const completion = d.completionTime === null ? '—' : `${fmtTime(d.completionTime)}（到达 ${fmtTime(d.completionTime - d.predecessor.dwell)} + 停留 ${d.predecessor.dwell} 秒）`;
+    const depart = d.successorDepart === null ? '—' : fmtTime(d.successorDepart);
+    let diff = '—';
+    if (d.status === 'satisfied') diff = `余 ${d.delta} 秒`;
+    else if (d.status === 'violated') diff = `缺 ${-d.delta} 秒`;
+    let verdict = DEPENDENCY_STATUS_TEXT[d.status];
+    if (d.status === 'unknown') verdict += `（${d.reason}）`;
+    lines.push(
+      `| ${idx + 1} | ${before} | ${wait} | ${after} | ${completion} | ${depart} | ${diff} | ${verdict} |`
+    );
+  });
+  lines.push('');
+}
+
 /* ---------- 基线对比摘要 ---------- */
 
 function statusPlain(status) {
@@ -396,11 +451,14 @@ function toMarkdown(result, evacuation) {
   lines.push(`| ❌ 无法按时抵达 | ${s.failed} |`);
   lines.push(`| ⛔ 区域不可达 | ${s.unreachable} |`);
   lines.push(`| 🚶 通道占用冲突 | ${s.conflicts || 0} |`);
+  lines.push(`| 🔗 口令依赖（满足 / 违约 / 无法判定） | ${s.dependencies || 0}（${s.dependenciesSatisfied || 0} / ${s.dependenciesViolated || 0} / ${s.dependenciesUnknown || 0}） |`);
   lines.push('');
 
   renderBaselineComparison(lines, result);
 
   renderConflictSummary(lines, result);
+
+  renderDependencies(lines, result);
 
   for (const actor of result.actors) {
     lines.push(`## ${actor.actorName}`);
